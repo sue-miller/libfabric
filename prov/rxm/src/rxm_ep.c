@@ -928,16 +928,14 @@ static int rxm_ep_close(struct fid *fid)
 		return ret;
 
 	rxm_ep_txrx_res_close(ep);
-	if (ep->msg_srx) {
-		ret = fi_close(&ep->msg_srx->fid);
-		if (ret) {
-			FI_WARN(&rxm_prov, FI_LOG_EP_CTRL, \
-				"Unable to close msg shared ctx\n");
-			return ret;
-		}
-		ep->msg_srx = NULL;
-	}
 
+	/* For XRC the shared receive queue (msg_srx) references the RX CQ, and
+	 * vrb_cq_close() is responsible for reaping any XRC SRQ still on its
+	 * list once the XRC QPs have been torn down.  Close msg_cq *before*
+	 * msg_srx so the SRQ is destroyed by the CQ-close path (after QP
+	 * teardown) rather than eagerly from the SRX close, which races the CQ
+	 * reap and fails with EBUSY while XRC QPs are still attached — leaving
+	 * the endpoint half torn down (hang) or a dangling srq_entry (UAF). */
 	if (ep->msg_cq) {
 		ret = fi_close(&ep->msg_cq->fid);
 		if (ret) {
@@ -946,6 +944,16 @@ static int rxm_ep_close(struct fid *fid)
 			return ret;
 		}
 		ep->msg_cq = NULL;
+	}
+
+	if (ep->msg_srx) {
+		ret = fi_close(&ep->msg_srx->fid);
+		if (ret) {
+			FI_WARN(&rxm_prov, FI_LOG_EP_CTRL, \
+				"Unable to close msg shared ctx\n");
+			return ret;
+		}
+		ep->msg_srx = NULL;
 	}
 
 	if (ep->util_coll_ep) {
