@@ -571,6 +571,7 @@ struct vrb_ini_shared_conn {
 	enum vrb_ini_qp_state		state;
 	struct rdma_cm_id		*phys_conn_id;
 	struct ibv_qp			*ini_qp;
+	struct rdma_cm_id		*ini_qp_id;
 	uint32_t			tgt_qpn;
 
 	/* EP waiting on or using this INI/TGT physical connection will be in
@@ -705,6 +706,15 @@ struct vrb_context {
 enum ibv_wc_opcode vrb_wr2wc_opcode(enum ibv_wr_opcode wr);
 
 #define VERBS_XRC_EP_MAGIC		0x1F3D5B79
+/* A shared INI QP backing CM id orphaned by a reciprocal-reconnect
+ * recreate generation (or handed off at the last ini_conn reference),
+ * queued for rdma_destroy_id() under the EQ event_lock in
+ * vrb_ep_destroy_xrc_qp(), where destroying a CM id is legal. */
+struct vrb_deferred_cm_id {
+	struct vrb_deferred_cm_id	*next;
+	struct rdma_cm_id		*id;
+};
+
 struct vrb_xrc_ep {
 	/* Must be first */
 	struct vrb_ep			base_ep;
@@ -721,6 +731,7 @@ struct vrb_xrc_ep {
 	/* A reference is held to a shared physical XRC INI/TGT QP connecting
 	 * to the destination node. */
 	struct vrb_ini_shared_conn	*ini_conn;
+	struct vrb_deferred_cm_id		*ini_qp_id_defer;
 	struct dlist_entry		ini_conn_entry;
 
 	/* The following is used for resending lost SIDR accept response
@@ -861,6 +872,7 @@ void vrb_sched_ini_conn(struct vrb_ini_shared_conn *ini_conn);
 int vrb_get_shared_ini_conn(struct vrb_xrc_ep *ep,
 			       struct vrb_ini_shared_conn **ini_conn);
 void vrb_put_shared_ini_conn(struct vrb_xrc_ep *ep);
+void vrb_relinquish_ini_qp_id_if_owner(struct vrb_xrc_ep *ep);
 
 void vrb_save_priv_data(struct vrb_xrc_ep *ep, const void *data,
 			   size_t len);

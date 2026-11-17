@@ -137,6 +137,31 @@ insert_err:
 	return ret;
 }
 
+/* Park an orphaned shared INI QP backing CM id and push it onto the given
+ * endpoint\'s deferred-destroy stack. Caller holds ini_lock; this
+ * function must never call rdma_destroy_id() (it blocks on the CM event
+ * thread, which takes ini_lock -> deadlock). On allocation failure the
+ * id is intentionally leaked rather than risking that deadlock. */
+static void vrb_defer_ini_qp_id(struct vrb_xrc_ep *owner,
+				 struct rdma_cm_id *id)
+{
+	struct vrb_deferred_cm_id *node;
+
+	if (!id)
+		return;
+
+	node = malloc(sizeof(*node));
+	if (!node) {
+		VRB_WARN(FI_LOG_EP_CTRL,
+			   "XRC defer alloc failed; leaking INI QP CM id\n");
+		return;
+	}
+	node->id = id;
+	id->context = NULL;
+	node->next = owner->ini_qp_id_defer;
+	owner->ini_qp_id_defer = node;
+}
+
 void _vrb_put_shared_ini_conn(struct vrb_xrc_ep *ep)
 {
 	struct vrb_domain *domain = vrb_ep2_domain(&ep->base_ep);
@@ -171,6 +196,16 @@ void _vrb_put_shared_ini_conn(struct vrb_xrc_ep *ep)
 			VRB_WARN(FI_LOG_EP_CTRL,
 				   "Destroy of XRC physical INI QP failed %d\n",
 				   errno);
+		ini_conn->ini_qp = NULL;
+
+		/* The CM id the shared INI QP was created on must be destroyed
+		 * via rdma_destroy_id() outside ini_lock. Queue it on this
+		 * endpoint for deferred destroy in vrb_ep_destroy_xrc_qp(). */
+		if (ini_conn->ini_qp_id) {
+			if (ini_conn->ini_qp_id != ep->base_ep.id)
+				vrb_defer_ini_qp_id(ep, ini_conn->ini_qp_id);
+			ini_conn->ini_qp_id = NULL;
+		}
 
 		assert(dlist_empty(&ini_conn->pending_list));
 		vrb_set_ini_conn_key(ep, &key);
@@ -178,8 +213,44 @@ void _vrb_put_shared_ini_conn(struct vrb_xrc_ep *ep)
 		free(ini_conn->peer_addr);
 		free(ini_conn);
 	} else {
+		/* Not the last reference: if this departing endpoint owns
+		 * the CM id backing the still-live shared QP, relinquish it
+		 * so vrb_ep_destroy_xrc_qp() does not free it out from under
+		 * the QP. Park its context; the recreate/last-reference path
+		 * queues it for deferred destroy. */
+		if (ep->base_ep.id && ep->base_ep.id == ini_conn->ini_qp_id) {
+			ep->base_ep.id->context = NULL;
+			ep->base_ep.id = NULL;
+		}
 		vrb_sched_ini_conn(ini_conn);
 	}
+}
+
+/* Fix #6: CM event handlers (vrb_eq_xrc_timewait_event(),
+ * vrb_eq_xrc_connect_retry()) can destroy ep->base_ep.id directly, outside
+ * any of the ini_conn-aware close/reconnect bookkeeping above. If that id is
+ * still the shared XRC INI connection's backing id (ini_conn->ini_qp_id),
+ * destroying it here without also clearing ini_conn's reference leaves a
+ * dangling pointer that a sibling endpoint later defers and destroys a
+ * second time (confirmed via AddressSanitizer: heap-use-after-free in
+ * vrb_defer_ini_qp_id(), freed by vrb_eq_xrc_timewait_event() -- a routine
+ * RDMA_CM_EVENT_TIMEWAIT_EXIT, not an edge case). Call this immediately
+ * before any direct rdma_destroy_id(ep->base_ep.id) outside of
+ * vrb_ep_destroy_xrc_qp() itself, to relinquish ini_conn's reference first. */
+void vrb_relinquish_ini_qp_id_if_owner(struct vrb_xrc_ep *ep)
+{
+	struct vrb_domain *domain;
+
+	if (!ep->ini_conn || !ep->base_ep.id)
+		return;
+
+	domain = vrb_ep2_domain(&ep->base_ep);
+	domain->xrc.lock_acquire(&domain->xrc.ini_lock);
+	if (ep->ini_conn->ini_qp_id == ep->base_ep.id)
+		ep->ini_conn->ini_qp_id = NULL;
+	if (ep->ini_conn->phys_conn_id == ep->base_ep.id)
+		ep->ini_conn->phys_conn_id = NULL;
+	domain->xrc.lock_release(&domain->xrc.ini_lock);
 }
 
 void vrb_put_shared_ini_conn(struct vrb_xrc_ep *ep)
@@ -266,6 +337,17 @@ void vrb_sched_ini_conn(struct vrb_ini_shared_conn *ini_conn)
 				goto err;
 			}
 			ep->ini_conn->ini_qp = ep->base_ep.id->qp;
+			/* v4: this recreate generation retires the previous
+			 * shared-QP backing id. Queue it for deferred destroy
+			 * on THIS endpoint (which will keep the new id and,
+			 * eventually, drain the queue in
+			 * vrb_ep_destroy_xrc_qp()) instead of overwriting and
+			 * losing track of it -- the residual leak/UAF seen
+			 * under heavy reciprocal-reconnect churn at scale. */
+			if (ep->ini_conn->ini_qp_id &&
+			    ep->ini_conn->ini_qp_id != ep->base_ep.id)
+				vrb_defer_ini_qp_id(ep, ep->ini_conn->ini_qp_id);
+			ep->ini_conn->ini_qp_id = ep->base_ep.id;
 			ep->ini_conn->state = VRB_INI_QP_CONNECTING;
 			ep->ini_conn->phys_conn_id = ep->base_ep.id;
 		} else {
@@ -438,6 +520,18 @@ int vrb_ep_destroy_xrc_qp(struct vrb_xrc_ep *ep)
 	if (ep->base_ep.id) {
 		rdma_destroy_id(ep->base_ep.id);
 		ep->base_ep.id = NULL;
+	}
+	/* Destroy every shared INI QP backing CM id this endpoint
+	 * retired (last-reference handoff, or reciprocal-reconnect
+	 * recreate generations). Legal here: this runs under the EQ
+	 * event_lock, never under ini_lock, and strictly before this
+	 * endpoint (and its EQ/channel) can be torn down further. */
+	while (ep->ini_qp_id_defer) {
+		struct vrb_deferred_cm_id *node = ep->ini_qp_id_defer;
+
+		ep->ini_qp_id_defer = node->next;
+		rdma_destroy_id(node->id);
+		free(node);
 	}
 	if (ep->tgt_ibv_qp)
 		vrb_put_tgt_qp(ep);

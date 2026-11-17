@@ -720,6 +720,7 @@ vrb_eq_xrc_connect_retry(struct vrb_xrc_ep *ep,
 
 	*acked = 1;
 	rdma_ack_cm_event(cma_event);
+	vrb_relinquish_ini_qp_id_if_owner(ep);
 	rdma_destroy_id(ep->base_ep.id);
 	ep->base_ep.id = NULL;
 	vrb_eq_clear_xrc_conn_tag(ep);
@@ -828,6 +829,7 @@ vrb_eq_xrc_timewait_event(struct vrb_eq *eq,
 	} else if (cma_event->id == ep->base_ep.id) {
 		*acked = 1;
 		rdma_ack_cm_event(cma_event);
+		vrb_relinquish_ini_qp_id_if_owner(ep);
 		rdma_destroy_id(ep->base_ep.id);
 		ep->base_ep.id = NULL;
 	}
@@ -933,6 +935,15 @@ vrb_eq_cm_process_event(struct vrb_eq *eq,
 	struct vrb_xrc_ep *xrc_ep;
 
 	assert(ofi_mutex_held(&eq->event_lock));
+
+	/* A parked XRC INI CM id keeps the shared INI QP backing id alive
+	 * after its owning endpoint was torn down; its context was cleared
+	 * so drop any late event here instead of dereferencing a freed EP. */
+	if (!fid) {
+		ret = -FI_EAGAIN;
+		goto ack;
+	}
+
 	switch (cma_event->event) {
 	case RDMA_CM_EVENT_ADDR_RESOLVED:
 		ep = container_of(fid, struct vrb_ep, util_ep.ep_fid);
