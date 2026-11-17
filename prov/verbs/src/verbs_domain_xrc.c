@@ -251,6 +251,28 @@ void vrb_sched_ini_conn(struct vrb_ini_shared_conn *ini_conn)
 			goto err;
 		}
 
+		/* v2.6.0 moved address resolution off vrb_create_ep() (the
+		 * normal MSG endpoint resolves asynchronously). The XRC INI
+		 * path still creates the shared INI QP eagerly below and later
+		 * calls rdma_resolve_route(), both of which require the CM id
+		 * to be bound to the RDMA device (id->verbs != NULL). Resolve
+		 * the address synchronously here — the id is still in sync
+		 * mode (created with a NULL event channel; migrated further
+		 * down) so this blocks until the id is device-bound. Without
+		 * it, rdma_create_qp_ex() returns EINVAL and the connection
+		 * retries forever, livelocking XRC+SRX during MPI_Init. */
+		ret = rdma_resolve_addr(ep->base_ep.id,
+					ep->base_ep.info_attr.src_addr,
+					ep->base_ep.info_attr.dest_addr,
+					VERBS_RESOLVE_TIMEOUT);
+		if (ret) {
+			ret = -errno;
+			VRB_WARN(FI_LOG_EP_CTRL,
+				   "XRC INI rdma_resolve_addr failed %d\n",
+				   -ret);
+			goto err;
+		}
+
 		if (last_state == VRB_INI_QP_UNCONNECTED) {
 			assert(!ep->ini_conn->phys_conn_id && ep->base_ep.id);
 
