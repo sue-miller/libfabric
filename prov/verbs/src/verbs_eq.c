@@ -959,11 +959,20 @@ vrb_eq_cm_process_event(struct vrb_eq *eq,
 		assert(ep->state == VRB_RESOLVE_ROUTE);
 		ep->state = VRB_CONNECTING;
 
-		if (cma_event->id->route.addr.src_addr.sa_family != AF_IB) {
-			vrb_eq_skip_rdma_cm_hdr((const void **)&ep->conn_param.private_data,
-						(size_t *)&ep->conn_param.private_data_len);
-		} else {
-			vrb_msg_ep_prepare_rdma_cm_hdr(ep->cm_priv_data, ep->id);
+		/* XRC endpoints build their own connection private data (a raw
+		 * struct vrb_xrc_cm_data, parsed directly by the peer via
+		 * vrb_eq_set_xrc_info) and never carry a struct vrb_rdma_cm_hdr.
+		 * The CONNECT_REQUEST receive path already excludes XRC from the
+		 * rdma_cm_hdr handling (via vrb_is_xrc_info); mirror that here so
+		 * we do not strip a nonexistent header off the XRC cm data, which
+		 * would corrupt it and make the peer read version 0 (REJ). */
+		if (!vrb_is_xrc_ep(ep)) {
+			if (cma_event->id->route.addr.src_addr.sa_family != AF_IB) {
+				vrb_eq_skip_rdma_cm_hdr((const void **)&ep->conn_param.private_data,
+							(size_t *)&ep->conn_param.private_data_len);
+			} else {
+				vrb_msg_ep_prepare_rdma_cm_hdr(ep->cm_priv_data, ep->id);
+			}
 		}
 		vrb_prof_func_start("rdma_connect");
 		ret = rdma_connect(ep->id, &ep->conn_param);
